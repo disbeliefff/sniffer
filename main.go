@@ -19,13 +19,12 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
-// PacketCapturer handles network packet capturing and processing
 type PacketCapturer struct {
-	handle     *pcap.Handle         // pcap handle for packet capture
-	stop       bool                 // control flag for stopping capture
-	workers    int                  // number of parallel workers
-	packetChan chan gopacket.Packet // channel for passing packets to workers
-	wg         sync.WaitGroup       // wait group for worker management
+	handle     *pcap.Handle         
+	stop       bool                
+	workers    int                  
+	packetChan chan gopacket.Packet 
+	wg         sync.WaitGroup       
 }
 
 var packetCount uint64
@@ -35,7 +34,6 @@ var (
 	packetBufferSize = 1000           
 )
 
-// New creates a new PacketCapturer instance
 func New(iface, filter string) (*PacketCapturer, error) {
 	handle, err := pcap.OpenLive(iface, 1600, true, pcap.BlockForever)
 	if err != nil {
@@ -223,7 +221,6 @@ func main() {
 		}),
 	)
 
-	// Start progress bar updater
 	go func() {
 		for {
 			select {
