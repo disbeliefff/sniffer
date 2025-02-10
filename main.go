@@ -6,6 +6,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -16,18 +19,23 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
-// PacketCapturer handles network packet capturing operations
+// PacketCapturer handles network packet capturing and processing
 type PacketCapturer struct {
-	handle *pcap.Handle
-	stop   bool
+	handle     *pcap.Handle         // pcap handle for packet capture
+	stop       bool                 // control flag for stopping capture
+	workers    int                  // number of parallel workers
+	packetChan chan gopacket.Packet // channel for passing packets to workers
+	wg         sync.WaitGroup       // wait group for worker management
 }
 
 var packetCount uint64
 
+var (
+	defaultWorkers   = runtime.NumCPU() 
+	packetBufferSize = 1000           
+)
+
 // New creates a new PacketCapturer instance
-// iface: network interface name
-// filter: BPF filter expression
-// Returns initialized PacketCapturer or error if initialization fails
 func New(iface, filter string) (*PacketCapturer, error) {
 	handle, err := pcap.OpenLive(iface, 1600, true, pcap.BlockForever)
 	if err != nil {
@@ -38,21 +46,51 @@ func New(iface, filter string) (*PacketCapturer, error) {
 		return nil, fmt.Errorf("BPF filter error: %w", err)
 	}
 
+	workers := getWorkerCount()
+
 	return &PacketCapturer{
-		handle: handle,
-		stop:   false,
+		handle:     handle,
+		stop:       false,
+		workers:    workers,
+		packetChan: make(chan gopacket.Packet, packetBufferSize),
 	}, nil
 }
 
+func getWorkerCount() int {
+	if workers := os.Getenv("DNS_SNIFFER_WORKERS"); workers != "" {
+		if n, err := strconv.Atoi(workers); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultWorkers
+}
+
 func (pc *PacketCapturer) Start() {
+	for i := 0; i < pc.workers; i++ {
+		pc.wg.Add(1)
+		go pc.worker()
+	}
+
 	packetSource := gopacket.NewPacketSource(pc.handle, pc.handle.LinkType())
+
 	for packet := range packetSource.Packets() {
 		if pc.stop {
 			break
 		}
+		pc.packetChan <- packet
+	}
+
+	close(pc.packetChan)
+	pc.wg.Wait()
+}
+
+func (pc *PacketCapturer) worker() {
+	defer pc.wg.Done()
+	for packet := range pc.packetChan {
 		pc.processPacket(packet)
 	}
 }
+
 
 func (pc *PacketCapturer) Stop() {
 	pc.stop = true
@@ -61,7 +99,6 @@ func (pc *PacketCapturer) Stop() {
 	}
 }
 
-// processPacket handles individual packet processing
 func (pc *PacketCapturer) processPacket(packet gopacket.Packet) {
 	atomic.AddUint64(&packetCount, 1)
 
@@ -83,14 +120,12 @@ func ProcessDNSPacket(dnsPacket *layers.DNS, ts time.Time) {
 	fmt.Printf("Request ID: %d\n", dnsPacket.ID)
 	fmt.Printf("QR Flag (Query/Response): %v\n", dnsPacket.QR)
 
-	// Display DNS questions section
 	if len(dnsPacket.Questions) > 0 {
 		for _, question := range dnsPacket.Questions {
 			fmt.Printf("Question: %s, Type: %v\n", string(question.Name), question.Type)
 		}
 	}
 
-	// Display DNS answers section (if response packet)
 	if dnsPacket.QR && len(dnsPacket.Answers) > 0 {
 		for _, answer := range dnsPacket.Answers {
 			fmt.Printf("Answer: %s -> ", string(answer.Name))
@@ -104,8 +139,6 @@ func ProcessDNSPacket(dnsPacket *layers.DNS, ts time.Time) {
 	fmt.Println("------------------------")
 }
 
-// findInterface automatically detects suitable network interface
-// Returns interface name or error if no valid interface found
 func findInterface() (string, error) {
 	devices, err := pcap.FindAllDevs()
 	if err != nil {
@@ -122,7 +155,6 @@ func findInterface() (string, error) {
 			continue
 		}
 
-		// Find matching network interface
 		var netInt *net.Interface
 		for i, ni := range netInts {
 			if ni.Name == dev.Name {
@@ -130,22 +162,20 @@ func findInterface() (string, error) {
 				break
 			}
 		}
-		if netInt == nil {
-			continue
-		}
 
-		if netInt.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		if netInt.Flags&net.FlagUp == 0 {
+		if netInt == nil ||
+			netInt.Flags&net.FlagLoopback != 0 ||
+			netInt.Flags&net.FlagUp == 0 {
 			continue
 		}
 
 		addrs, err := netInt.Addrs()
 		if err != nil {
+			log.Printf("Interface %s: address error - %v", netInt.Name, err)
 			continue
 		}
 
+		// Check for valid IPv4 address
 		for _, addr := range addrs {
 			ipNet, ok := addr.(*net.IPNet)
 			if ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
@@ -160,7 +190,6 @@ func findInterface() (string, error) {
 func main() {
 	iface := os.Getenv("DNS_SNIFFER_INTERFACE")
 	var err error
-
 	if iface == "" {
 		iface, err = findInterface()
 		if err != nil {
@@ -169,8 +198,7 @@ func main() {
 	}
 
 	filter := "udp and port 53"
-	log.Println("Starting DNS Sniffer on interface:", iface)
-
+	log.Printf("Starting DNS Sniffer on interface %s (%d workers)", iface, getWorkerCount())
 	capturer, err := New(iface, filter)
 	if err != nil {
 		log.Fatalf("Capture initialization failed on %s: %v", iface, err)
@@ -195,6 +223,7 @@ func main() {
 		}),
 	)
 
+	// Start progress bar updater
 	go func() {
 		for {
 			select {
